@@ -14,18 +14,366 @@
   "env": "",
   "permissions": [],
   "requirements": [
-    "https://cdn.jsdelivr.net/npm/hypha-rpc@latest/dist/hypha-rpc-websocket.min.js"
+    "https://cdn.jsdelivr.net/npm/hypha-rpc@0.20.38/dist/hypha-rpc-websocket.min.js",
+    "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js",
+    "https://docs.opencv.org/4.5.0/opencv.js"
   ],
   "dependencies": []
 }
 </config>
 
 <script lang="javascript">
+const modelUrls = {
+  // "vit_b": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",  // TODO: Replace with ONNX decoder model
+  "vit_b_lm": "https://uk1s3.embassy.ebi.ac.uk/public-datasets/sam-vit_b_lm-decoder/1/model.onnx",
+  // "vit_b_em_organelles": "https://uk1s3.embassy.ebi.ac.uk/public-datasets/bioimage.io/noisy-ox/1/files/vit_b.pt",  // TODO: Replace with ONNX decoder model
+};
+    
+const loadSamDecoder = (modelName) => {
+  // Check if model in localStorage
+  const modelUrl = modelUrls[modelName];
+  console.log('Starting to created ONNX model from', modelUrl);
+  const modelPromise = ort.InferenceSession.create(modelUrl)
+    .then((model) => {
+      console.log('ONNX model created', model);
+      return model;
+    })
+    .catch((error) => {
+      console.error('Error creating ONNX model:', error);
+      throw error; // Propagate the error
+    });
+
+  return modelPromise;
+};
+    
+const extractConfig = (ctx) => {
+  // Extract configuration settings and check if they are valid
+  const config = ctx.config || {};
+
+  if (!config.server_url) {
+    console.log("No server URL provided in the configuration. Using the default server URL.");
+    config.server_url = "https://hypha.aicell.io";
+    config.workspace = null;
+    config.token = null;
+  } else {
+    if (!config.workspace) {
+      console.log("No workspace provided in the configuration.");
+    }
+    if (!config.token) {
+      console.log("No token provided in the configuration.");
+      // Login before connecting and then use userid
+      // TODO: Add login functionality
+    }
+  }
+
+  if (!config.annotation_service_id) {
+    console.log("No annotation service ID provided in the configuration. Using example image.");
+    api.alert("No annotation service ID provided in the configuration. Using example image.");
+  }
+
+  return {
+    serverUrl: config.server_url,
+    workspace: config.workspace,
+    token: config.token,
+    imageProviderId: config.annotation_service_id,
+    samServiceId: "bioimageio-colab/microsam"
+  };
+};
+    
+const getServices = async (config) => {
+  let imageService = null;
+  let samService = null;
+
+  if (config.imageProviderId) {
+    // Connect to the Hypha server
+    console.log(`Connecting to server ${config.serverUrl}...`);
+    await api.showMessage(`Connecting to server ${config.serverUrl}...`);
+
+    // Connect to the server
+    const server = await hyphaWebsocketClient.connectToServer({
+      server_url: config.serverUrl,
+      workspace: config.workspace,
+      token: config.token,
+    });
+
+    // Get the current workspace and user ID
+    const currentWorkspace = server.config.user.scope.current_workspace;
+    const userID = server.config.user.id;
+    console.log(`Connected to workspace ${currentWorkspace} as user ${userID}.`);
+
+    // Get the image provider service from the server
+    try {
+      imageService = await server.getService(config.imageProviderId);
+    } catch (e) {
+      console.error(e);
+      await api.alert(
+        `The image provider cannot be reached (ID: ${config.imageProviderId}). Please check if the service is running.`
+      );
+    }
+
+    // Get the SAM service from the server
+    try {
+      samService = await server.getService(config.samServiceId, { mode: "random" });
+    } catch (e) {
+      samService = null;
+      console.error(e);
+      await api.alert(
+        `The SAM service is currently not reachable (ID: ${config.samServiceId}). Please wait a few minutes and reload the page to try again.`,
+        { duration: 6000 }
+      );
+    }
+  }
+
+  // Return the services
+  return [ imageService, samService ];
+};
+    
+const loadExampleImage = async () => {
+  try {
+    // Fetch the image from the provided URL
+    const exampleImageUrl = 'https://raw.githubusercontent.com/bioimage-io/bioimageio-colab/main/bioimageio_colab/example_image.png';
+    const response = await fetch(exampleImageUrl);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const blob = await response.blob();
+
+    // Convert the blob to an ImageBitmap
+    const imageBitmap = await createImageBitmap(blob);
+
+    // Create a canvas to draw the image for pixel data extraction
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+
+    // Set canvas dimensions to match the image
+    canvas.width = imageBitmap.width;
+    canvas.height = imageBitmap.height;
+
+    // Draw the image onto the canvas
+    ctx.drawImage(imageBitmap, 0, 0);
+
+    // Get pixel data from the canvas
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const pixels = imageData.data; // This is a Uint8ClampedArray
+
+    // Convert the pixel data into an ndarray-like format
+    const image = {
+      _rtype: "ndarray",
+      _rvalue: pixels.buffer, // Use ArrayBuffer for the pixel data
+      _rshape: [canvas.height, canvas.width, 4], // RGBA format (4 channels)
+      _rdtype: "uint8" // Data type for the pixel values
+    };
+    const fileName = 'example_image.tif'
+
+    console.log('Example image loaded into ndarray format');
+    return [ image, fileName ];
+  } catch (error) {
+    console.error('Failed to load example image:', error);
+    throw error;
+  }
+};
+    
+const downloadExampleEmbedding = async () => {
+  const embeddingUrl = "https://raw.githubusercontent.com/bioimage-io/bioimageio-colab/main/bioimageio_colab/example_image_embeddings.bin";
+  console.log('Downloading binary embedding from:', embeddingUrl);
+  
+  try {
+    const response = await fetch(embeddingUrl);
+    if (!response.ok) {
+      throw new Error('Failed to fetch the embedding.');
+    }
+    const binaryEmbedding = await response.arrayBuffer();
+    console.log('Embedding successfully downloaded.');
+    return binaryEmbedding;
+  } catch (error) {
+    console.error('Error downloading embedding:', error);
+    throw error; // Rethrow error to propagate it
+  }
+};
+    
+const loadBinaryTensor = async (binaryEmbedding, embeddingShape) => {
+  try {
+    const dst = new ArrayBuffer(binaryEmbedding.byteLength);
+    new Uint8Array(dst).set(new Uint8Array(binaryEmbedding));
+    const b = new Float32Array(dst);
+    const dType = "float32"
+    const featureTensor = new ort.Tensor(dType, b, embeddingShape);
+    console.log('Tensor successfully created.');
+    return featureTensor;
+  } catch (error) {
+    console.error('Error creating tensor from binary embedding:', error);
+    throw error; // Rethrow error to propagate it
+  }
+};
+    
+const loadExampleEmbedding = async () => {
+  const embeddingShape = [1, 256, 64, 64];
+  console.log('Starting to load example image embedding...');
+
+  // Return the promise directly
+  const embeddingPromise = downloadExampleEmbedding()
+    .then(binaryEmbedding => loadBinaryTensor(binaryEmbedding, embeddingShape))
+    .then(featureTensor => {
+      console.log('Example embedding has been successfully downloaded and prepared.');
+      return featureTensor; // Return the tensor for use later
+    })
+    .catch(error => {
+      console.error('An error occurred while preparing the embedding:', error);
+      throw error; // Propagate the error
+    });
+  return embeddingPromise
+};
+
+const setModelScale = (image) => {
+  console.log("Calculating model scale")
+  const LONG_SIDE_LENGTH = 1024;
+  const w = image._rshape[0];
+  const h = image._rshape[1];
+  const samScale = LONG_SIDE_LENGTH / Math.max(h, w);
+  const modelScale = { height: h, width: w, samScale };
+  console.log("Set model scale to:", modelScale)
+  return modelScale
+};
+    
+const setModelData = ({ clicks, embeddings, modelScale }) => {
+  let pointCoords;
+  let pointLabels;
+  let pointCoordsTensor;
+  let pointLabelsTensor;
+
+  // Check there are input click prompts
+  if (clicks) {
+    let n = clicks.length;
+
+    // If there is no box input, a single padding point with 
+    // label -1 and coordinates (0.0, 0.0) should be concatenated
+    // so initialize the array to support (n + 1) points.
+    pointCoords = new Float32Array(2 * (n + 1));
+    pointLabels = new Float32Array(n + 1);
+
+    // Add clicks and scale to what SAM expects
+    for (let i = 0; i < n; i++) {
+      pointCoords[2 * i] = clicks[i].x * modelScale.samScale;
+      pointCoords[2 * i + 1] = clicks[i].y * modelScale.samScale;
+      pointLabels[i] = clicks[i].clickType;
+    }
+
+    // Add in the extra point/label when only clicks and no box
+    // The extra point is at (0, 0) with label -1
+    pointCoords[2 * n] = 0.0;
+    pointCoords[2 * n + 1] = 0.0;
+    pointLabels[n] = -1.0;
+
+    // Create the tensor
+    pointCoordsTensor = new ort.Tensor("float32", pointCoords, [1, n + 1, 2]);
+    pointLabelsTensor = new ort.Tensor("float32", pointLabels, [1, n + 1]);
+  }
+  const imageSizeTensor = new ort.Tensor("float32", [
+    modelScale.height,
+    modelScale.width,
+  ]);
+
+  if (pointCoordsTensor === undefined || pointLabelsTensor === undefined)
+    return;
+
+  // There is no previous mask, so default to an empty tensor
+  const maskInput = new ort.Tensor(
+    "float32",
+    new Float32Array(256 * 256),
+    [1, 1, 256, 256]
+  );
+  // There is no previous mask, so default to 0
+  const hasMaskInput = new ort.Tensor("float32", [0]);
+
+  return {
+    image_embeddings: embeddings,
+    point_coords: pointCoordsTensor,
+    point_labels: pointLabelsTensor,
+    orig_im_size: imageSizeTensor,
+    mask_input: maskInput,
+    has_mask_input: hasMaskInput,
+  };
+};
+    
+const processMaskToGeoJSON = (masks) => {
+  // Dimensions of the mask (batch, channels, width, height)
+  const [b, c, width, height] = masks.dims;
+
+  // 1. Apply threshold to create binary mask
+  const binaryMask = new Uint8Array(width * height);
+  for (let i = 0; i < masks.data.length; i++) {
+    binaryMask[i] = masks.data[i] > 0.0 ? 255 : 0;
+  }
+
+  // Convert binaryMask to an OpenCV.js Mat
+  const binaryMat = new cv.Mat(height, width, cv.CV_8UC1);
+  binaryMat.data.set(binaryMask);
+
+  // 2. Use OpenCV.js to find contours
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  cv.findContours(
+    binaryMat,
+    contours,
+    hierarchy,
+    cv.RETR_EXTERNAL, // Retrieve only external contours
+    cv.CHAIN_APPROX_SIMPLE // Compress horizontal, vertical, and diagonal segments
+  );
+
+  // 3. Process contours into GeoJSON-compatible features
+  const features = [];
+
+  if (contours.size() > 0) {
+    // Pick the largest contour as the main object
+    let largestContourIndex = 0;
+    let largestContourSize = 0;
+    for (let i = 0; i < contours.size(); i++) {
+      const c = contours.get(i);
+      if (c.rows > largestContourSize) {
+        largestContourSize = c.rows;
+        largestContourIndex = i;
+      }
+    }
+
+    const largestContour = contours.get(largestContourIndex);
+    const pts = [];
+
+    for (let i = 0; i < largestContour.rows; i++) {
+      const x = largestContour.intPtr(i)[0]; // x coordinate
+      const y = largestContour.intPtr(i)[1]; // y coordinate
+      pts.push([x, y]);
+    }
+
+    // Close the polygon if not closed
+    if (
+      pts.length > 0 &&
+      (pts[0][0] !== pts[pts.length - 1][0] || pts[0][1] !== pts[pts.length - 1][1])
+    ) {
+      pts.push(pts[0]);
+    }
+
+    // Add the polygon to the features array
+    features.push(pts);
+  }
+
+  console.log('===== contours =====>', features);
+
+  // Clean up memory
+  contours.delete();
+  hierarchy.delete();
+  binaryMat.delete();
+
+  return features;
+};
+
+    
 class BioImageIOColabAnnotator {
     constructor() {
         this.image = null; // Current image
-        this.mask = null; // Current mask
         this.filename = null; // Filename of the current image
+        this.mask = null; // Current mask
         this.imageLayer = null; // Layer displaying the image
         this.annotationLayer = null; // Layer displaying the annotations
         this.edgeColor = "magenta"; // Default edge color for annotations
@@ -37,55 +385,21 @@ class BioImageIOColabAnnotator {
     }
 
     async run(ctx) {
-        // Extract configuration settings
-        const config = ctx.config || {};
-        const serverUrl = config.server_url || "https://hypha.aicell.io";
-        const workspace = config.workspace;
-        const token = config.token;
-        const annotationServiceId = config.annotation_service_id;
-        if(!annotationServiceId){
-            await api.alert("Please provide the annotation service ID in the configuration.");
-            return;
-        }
-        const samServiceId = "bioimageio-colab/microsam";
-        
         // Create and display the viewer window
         const viewer = await api.createWindow({src: "https://kaibu.org/#/app", fullscreen: true});
-        await api.showMessage(`Connecting to server ${serverUrl}...`);
-        // Login before connecting and then use userid
-        // TODO: Add login functionality
-
-        // Connect to the Hypha server
-        const server = await hyphaWebsocketClient.connectToServer({
-            server_url: serverUrl,
-            token: token,
-            workspace: workspace,
-        });
-
-        // Get the user ID
-        const userID = server.config.user.id;
-        await api.showMessage(`Connected to workspace ${server.config.user.scope.current_workspace} as user ${userID}.`);
-
-        // Get the bioimageio-colab service from the server
-        let dataProvider;
-        try {
-            dataProvider = await server.getService(annotationServiceId);
-        } catch (e) {
-            await api.alert(`Failed to get the bioimageio-colab annotation service (id=${annotationServiceId}). (Error: ${e})`);
-            return;
-        }
-
-        // Get the SAM service from the server
-        let samService;
-        try {
-            samService = await server.getService(samServiceId, {"mode": "random"});
-        } catch (e) {
-            samService = null;
-            await api.showMessage(`Failed to get the bioimageio-colab SAM service (id=${samServiceId}). Please try again later.`);
-        }
-
-        // Flag to check if the image embedding is already calculated
-        let embeddingIsCalculated = false; 
+        
+        // Check the configuration
+        const config = await extractConfig(ctx);
+        
+        // Start loading the model
+        const modelPromise = loadSamDecoder(this.modelName);
+        
+        // Get the services
+        const [ imageService, samService ] = await getServices(config);
+        
+        let embeddingsPromise;
+        let modelScale;
+        let model;
 
         // Function to get a new image and set up the viewer
         const getImage = async () => {
@@ -94,17 +408,45 @@ class BioImageIOColabAnnotator {
                 await viewer.remove_layer({id: this.imageLayer.id});
                 await viewer.remove_layer({id: this.annotationLayer.id});
             }
+            
+            // Reset previous embedding
+            embeddingsPromise = null;
 
-            // Fetch a random image from the service
-            [this.image, this.filename] = await dataProvider.get_random_image();
-            this.imageLayer = await viewer.view_image(this.image, {name: "image"});
+            if (imageService) {
+              // Fetch a random image from the service
+              [this.image, this.filename] = await imageService.get_random_image();
 
-            // Clear any previous image embeddings from the SAM service
-            if (samService) {
-                embeddingIsCalculated = false;
-                await samService.clear_cache();
-            }
+              if (samService) {
+                // Create a promise for the embedding calculation, to be awaited later
+                embeddingsPromise = samService.compute_embedding(this.modelName, this.image)
+                  .then(result => {
+                    // Load the binary tensor using the result features
+                    return loadBinaryTensor(result.features._rvalue, result.features._rshape);
+                  })
+                  .then(featureTensor => {
+                    console.log('Image embedding has been successfully calculated and prepared.');
+                    return featureTensor; // Return the tensor for use later
+                  })
+                  .catch(error => {
+                    // Catch any errors during the embedding calculation or tensor preparation
+                    console.error('An error occurred while preparing the embedding:', error);
+                    throw error; // Propagate the error to be handled later
+                  });
+                }
+              } else {
+                // Load example image if image service is null
+                [this.image, this.filename] = await loadExampleImage();
 
+                // Create a promise for the example embedding calculation, to be awaited later
+                embeddingsPromise = loadExampleEmbedding();
+              }
+            
+            // Display the image immediately
+            this.imageLayer = await viewer.view_image(this.image, { name: "image" });
+            
+            // Set the model scale
+            modelScale = setModelScale(this.image)
+            
             // Add the annotation functionality to the interface
             this.annotationLayer = await viewer.add_shapes([], {
                 shape_type: "polygon",
@@ -114,69 +456,77 @@ class BioImageIOColabAnnotator {
                 // Callback for adding a new feature (annotation point)
                 add_feature_callback: async (shape) => {
                     if (shape.geometry.type === "Point") {
-                        if (samService) {
-                            // The point coordinates need to be reversed to match the coordinate convention of SAM
-                            const pointCoords = [shape.geometry.coordinates.reverse()];
-                            const pointLabels = pointCoords.map(() => 1); // All points have a label of 1
-                            let features = [];
+                        if (!embeddingsPromise) {
+                          await api.showMessage("Automated segmentation is disabled while SAM service can't be reached. Reload the page to try again.");  
+                          return;
+                        }
+                        
+                        // Prepare input for the model
+                        const clicks = [ {
+                            x: shape.geometry.coordinates[0], 
+                            y: shape.geometry.coordinates[1], 
+                            clickType: 1
+                        } ];
+                        // await api.showMessage("Computing image embeddings...");
+                        const embeddings = await embeddingsPromise
+                        const feeds = setModelData({
+                          clicks: clicks,
+                          embeddings: embeddings,
+                          modelScale: modelScale
+                        });
+                        console.log('===== feeds =====>', feeds)
+                        if (feeds === undefined) return;
+                        
+                        // Feed inputs and run
+                        model = await modelPromise;
+                        const results = await model.run(feeds);
+                        console.log("===== results =====>", results)
+                        
+                        // Convert the mask to GeoJSON
+                        const masks = results["masks"];
+                        const features = processMaskToGeoJSON(masks);
 
-                            // Compute embeddings if not already computed for the image
-                            try {
-                                if (!embeddingIsCalculated) {
-                                    await api.showMessage("Computing embedding and segmenting image...");
-                                } else {
-                                    await api.showMessage("Segmenting...");
-                                }
-                                features = await samService.segment(this.modelName, this.image, pointCoords, pointLabels);
-                                embeddingIsCalculated = true;
-                            } catch (e) {
-                                await api.showMessage(`Failed to compute the image embedding. (Error: ${e})`);
-                                return;
-                            }
-
-                            // Add the segmented features as polygons to the annotation layer
-                            for (let coords of features) {
-                                const polygon = {
-                                    type: "Feature",
-                                    coordinates: coords,
-                                    geometry: {
-                                        type: "Polygon",
-                                        coordinates: [coords],
-                                    },
-                                    properties: {
-                                        edge_color: this.edgeColor,
-                                        edge_width: 2,
-                                        size: 7,
-                                    },
-                                };
-                                this.annotationLayer.add_feature(polygon);
-                            }
-                        } else {
-                            await api.showMessage("Warning: SAM service not available. Please try again later.");
+                        // Add the segmented features as polygons to the annotation layer
+                        for (let coords of features) {
+                            const polygon = {
+                                type: "Feature",
+                                coordinates: coords,
+                                geometry: {
+                                    type: "Polygon",
+                                    coordinates: [coords],
+                                },
+                                properties: {
+                                    edge_color: this.edgeColor,
+                                    edge_width: 2,
+                                    size: 7,
+                                },
+                            };
+                            this.annotationLayer.add_feature(polygon);
                         }
                     }
                 }
             });
         };
-
+        
         // Function to save the annotation
         const saveAnnotation = async () => {
             if (!this.annotationLayer) return;
+            if (!imageService) return;
             const annotation = await this.annotationLayer.get_features();
             if (annotation.features.length > 0) {
-                await dataProvider.save_annotation(this.filename, annotation, [this.image._rshape[0], this.image._rshape[1]]);
+                await imageService.save_annotation(this.filename, annotation, [this.image._rshape[0], this.image._rshape[1]]);
                 await api.showMessage("Annotation saved.");
             } else {
                 await api.showMessage("No annotation provided. Saving was skipped.");
             }
         };
-
+        
         // Function to load the next image
         const nextImage = async () => {
             await saveAnnotation();
             await getImage();
         };
-
+        
         // Add a control widget with a button to load the next image
         await viewer.add_widget({
             _rintf: true,
@@ -200,4 +550,3 @@ class BioImageIOColabAnnotator {
 // Export the annotator class
 api.export(new BioImageIOColabAnnotator());
 </script>
-
